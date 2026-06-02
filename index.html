@@ -114,6 +114,10 @@
     margin-top: 18px;
   }
   .below .logout { align-self: flex-end; }
+  .below-right { align-self: flex-end; display: flex; gap: 16px; }
+  .pl-title { font-size: 22px; margin: 0 0 16px; }
+  .pl-embed { width: 100%; height: 420px; border: 0; border-radius: 12px; display: block; }
+  .pl-open { margin: 12px 0 0; }
   @media (max-width: 460px) {
     .rec-card { flex-direction: column; align-items: flex-start; }
     .rec-cover { width: 100%; height: auto; aspect-ratio: 1 / 1; }
@@ -233,7 +237,7 @@ const CLAUDE_URL = "/_lovely/proxy/api.anthropic.com/v1/messages";
 const CLAUDE_KEY = "{{ANTHROPIC_API_KEY}}";
 const CLAUDE_MODEL = "claude-sonnet-4-6";
 
-const SPOTIFY_SCOPE = "user-library-read";
+const SPOTIFY_SCOPE = "user-library-read playlist-modify-private";
 const REDIRECT_URI = window.location.origin + window.location.pathname;
 
 // Pull public config (the Spotify Client ID) from lovelyco's env module. On
@@ -256,6 +260,7 @@ const LS = {
   verifier: "ltt_pkce_verifier",
   state: "ltt_oauth_state",
   library: "ltt_library_v1", // cached taste profile (JSON), so we don't re-read Spotify every load
+  playlist: "ltt_playlist_id", // the one reusable scratch playlist we keep replacing
 };
 
 /* ----------------------------- DOM helper ------------------------------- */
@@ -264,10 +269,7 @@ function render(html) { stage.innerHTML = html; }
 
 /* In-memory state for the session */
 let library = null;            // cached pool of saved tracks + genres (see fetchLibrary)
-let recs = [];                 // current batch of enriched track recommendations
-let recIndex = 0;              // index of the one being shown
-let lastRaw = "";              // last raw Claude text (parse-failure fallback)
-const previousRecs = [];       // track names already suggested, to avoid repeats
+const previousRecs = [];       // track names already suggested, to avoid repeats across sets
 
 /* ============================================================================
    PKCE helpers
@@ -376,9 +378,10 @@ function clearTokens() {
 }
 
 /* ============================================================================
-   Spotify data fetch
+   Spotify API (read + write). Refreshes on 401; surfaces 403 as a scope problem
+   so the app can re-prompt for permissions.
    ========================================================================== */
-async function spotifyGet(path) {
+async function spotifyApi(path, { method = "GET", body } = {}) {
   let token = getValidTokenOrNull();
   if (!token) {
     const refreshed = await refreshToken();
@@ -386,24 +389,33 @@ async function spotifyGet(path) {
     token = localStorage.getItem(LS.token);
   }
 
-  let res = await fetch("https://api.spotify.com/v1" + path, {
-    headers: { Authorization: "Bearer " + token },
-  });
+  const build = (t) => {
+    const opts = { method, headers: { Authorization: "Bearer " + t } };
+    if (body !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    return opts;
+  };
 
-  // Token rejected mid-session → try one refresh, then retry
+  let res = await fetch("https://api.spotify.com/v1" + path, build(token));
+
+  // Token rejected mid-session → try one refresh, then retry.
   if (res.status === 401) {
     const refreshed = await refreshToken();
     if (!refreshed) throw new Error("AUTH_EXPIRED");
-    res = await fetch("https://api.spotify.com/v1" + path, {
-      headers: { Authorization: "Bearer " + localStorage.getItem(LS.token) },
-    });
+    res = await fetch("https://api.spotify.com/v1" + path, build(localStorage.getItem(LS.token)));
   }
-  // 403 = the stored token predates the user-library-read scope. A refresh keeps
-  // the same scopes, so force a fresh login to re-prompt for library access.
+  // 403 = token lacks a required scope (e.g. an older session from before we added
+  // playlist access). A refresh keeps the same scopes, so force a fresh login.
   if (res.status === 403) throw new Error("INSUFFICIENT_SCOPE");
   if (!res.ok) throw new Error("Spotify API error (" + res.status + "): " + (await res.text()));
-  return res.json();
+
+  const text = await res.text(); // some write endpoints return an empty body
+  return text ? JSON.parse(text) : {};
 }
+
+function spotifyGet(path) { return spotifyApi(path); }
 
 async function fetchLibrary() {
   const PAGE = 50;
@@ -561,15 +573,15 @@ const SYSTEM_INSTRUCTIONS =
   "genres, eras, scenes, and the long tail of music. You will be given a listener's " +
   "taste profile. Analyze it for patterns: genre, mood, era, instrumentation, " +
   "production style, and how obscure vs. mainstream their taste runs. Then recommend " +
-  "EXACTLY 10 specific TRACKS (individual songs) they most likely have NOT already " +
-  "heard. Avoid obvious or mainstream picks and anything already in their library — " +
-  "favor thoughtful, lateral choices that fit the through-line of their taste, with a " +
-  "little variety across the ten.\n\n" +
+  "the number of specific TRACKS (individual songs) requested in the message — ones they " +
+  "most likely have NOT already heard. Avoid obvious or mainstream picks and anything " +
+  "already in their library; favor thoughtful, lateral choices that fit the through-line " +
+  "of their taste, with some variety across the set.\n\n" +
   "Respond with ONLY a JSON object — no markdown, no code fence, no preamble — in " +
   'exactly this shape:\n' +
-  '{"tracks": [{"track": "<song title>", "artist": "<artist name>"}, ... 10 items]}';
+  '{"tracks": [{"track": "<song title>", "artist": "<artist name>"}, ...]}';
 
-async function askClaudeForTracks() {
+async function askClaudeForTracks(count) {
   // Fresh random sample of the cached library each call → a different slice.
   const tasteProfile = buildTasteProfile();
 
@@ -579,14 +591,14 @@ async function askClaudeForTracks() {
 
   const requestBody = {
     model: CLAUDE_MODEL,
-    max_tokens: 1024,
-    temperature: 1, // variety across batches
+    max_tokens: 1500,
+    temperature: 1, // variety across sets
     system: [
       { type: "text", text: SYSTEM_INSTRUCTIONS },
       { type: "text", text: tasteProfile },
     ],
     messages: [
-      { role: "user", content: "Recommend 10 tracks for this listener." + avoidClause },
+      { role: "user", content: `Recommend ${count} tracks for this listener.` + avoidClause },
     ],
   };
 
@@ -638,17 +650,45 @@ function parseTracks(text) {
 
 // Fetch a fresh batch of 10 and enrich them all on Spotify, so cycling through
 // with "Give me another" is instant (no per-track network wait).
-async function getRecommendations() {
-  viewLoading("Finding tracks that fit your taste…");
-  const { tracks, raw } = await askClaudeForTracks();
-  lastRaw = raw;
-  if (tracks.length) {
-    viewLoading("Looking them up on Spotify…");
-    recs = await Promise.all(tracks.map(enrichTrack));
-  } else {
-    recs = [];
+// Get (or create) the single reusable scratch playlist; returns its id.
+async function ensurePlaylist() {
+  const existing = localStorage.getItem(LS.playlist);
+  if (existing) {
+    try {
+      const pl = await spotifyApi(`/playlists/${existing}?fields=id`);
+      if (pl && pl.id) return pl.id;
+    } catch { /* unfollowed/deleted — make a fresh one */ }
   }
-  recIndex = 0;
+  const me = await spotifyApi("/me");
+  const created = await spotifyApi(`/users/${me.id}/playlists`, {
+    method: "POST",
+    body: {
+      name: "listen to this — picks",
+      description: "Auto-curated by listen to this. Contents are replaced each time.",
+      public: false,
+    },
+  });
+  localStorage.setItem(LS.playlist, created.id);
+  return created.id;
+}
+
+// Ask Claude for ~25 tracks, match them on Spotify, and REPLACE the scratch
+// playlist's contents (so we reuse one playlist instead of piling them up).
+const SET_SIZE = 25;
+async function buildPlaylist() {
+  viewLoading("Finding tracks that fit your taste…");
+  const { tracks } = await askClaudeForTracks(SET_SIZE);
+
+  viewLoading("Looking them up on Spotify…");
+  const enriched = await Promise.all(tracks.map(enrichTrack));
+  const uris = [...new Set(enriched.filter((r) => r.found && r.uri).map((r) => r.uri))];
+  if (!uris.length) { viewError("Couldn't match any of those on Spotify — try again."); return; }
+
+  viewLoading("Building your playlist…");
+  const id = await ensurePlaylist();
+  await spotifyApi(`/playlists/${id}/tracks`, { method: "PUT", body: { uris } }); // PUT replaces all items
+
+  viewPlaylist(id, uris.length);
 }
 
 /* ============================================================================
@@ -658,9 +698,9 @@ function viewLogin(note) {
   render(`
     <div class="card">
       <p class="kicker">listen to this</p>
-      <h1>One track at a time. Picked for your ears.</h1>
-      <p>Connect Spotify and Claude will study your saved library, then surface tracks
-         you probably haven't heard — one at a time, with a preview when available.</p>
+      <h1>A playlist, picked for your ears.</h1>
+      <p>Connect Spotify and Claude will study your saved library, then build a playlist
+         of tracks you probably haven't heard — playable right here.</p>
       ${note ? `<div class="error">${escapeHtml(note)}</div>` : ""}
       <div class="row">
         <button class="btn-primary" id="login">Connect Spotify</button>
@@ -701,74 +741,43 @@ function viewError(message) {
   document.getElementById("reset").onclick = logout;
 }
 
-function viewTrack(rec, autoplay) {
-  const title = (rec.found && rec.name) ? rec.name : rec.track;
-  const artist = (rec.found && rec.artistName) ? rec.artistName : rec.artist;
-
-  // Prefer spotify:track: (opens & plays in the desktop app); fall back to the
-  // web link, then a search. URIs are protocol handlers, so don't open a new tab.
-  const searchFallback = "https://open.spotify.com/search/" +
-    encodeURIComponent(`${rec.track} ${rec.artist}`);
-  const spotHref = rec.uri || rec.webUrl || searchFallback;
-  const tgt = spotHref.startsWith("spotify:") ? "" : ` target="_blank" rel="noopener"`;
-
-  const actions = rec.previewUrl
-    ? `<button class="play-btn" id="play">▶ Play preview</button>` +
-      `<a class="open-link" href="${spotHref}"${tgt}>Open in Spotify ↗</a>`
-    : `<a class="play-btn" href="${spotHref}"${tgt}>▶ Play in Spotify</a>`;
-
-  render(`
-    <div class="card rec-card">
-      ${rec.imageUrl
-        ? `<img class="rec-cover" src="${rec.imageUrl}" alt="${escapeHtml(title)} cover art" />`
-        : ""}
-      <div class="rec-info">
-        <h2 class="rec-name">${escapeHtml(title)}</h2>
-        <p class="rec-artist">${escapeHtml(artist)}</p>
-        <div class="play-row">${actions}</div>
-        ${rec.previewUrl
-          ? `<audio id="preview" src="${rec.previewUrl}" preload="auto"></audio>`
-          : `<p class="note">No 30-second preview for this track (Spotify limits previews for newer apps) — Play opens it in Spotify.</p>`}
-      </div>
-    </div>
-    <div class="below">
-      <button class="btn-ghost" id="again">Give me another</button>
-      <button class="link-btn logout" id="reset">Log out</button>
-    </div>
-  `);
-
-  wireAgain();
-  document.getElementById("reset").onclick = logout;
-
-  const audio = document.getElementById("preview");
-  const playBtn = document.getElementById("play");
-  if (audio && playBtn) {
-    playBtn.onclick = () => { audio.paused ? audio.play() : audio.pause(); };
-    audio.onplay = () => { playBtn.textContent = "⏸ Pause preview"; };
-    audio.onpause = () => { playBtn.textContent = "▶ Play preview"; };
-    audio.onended = () => { playBtn.textContent = "▶ Play preview"; };
-    if (autoplay) audio.play().catch(() => { /* autoplay may be blocked — fine */ });
-  }
-}
-
-function viewRawFallback() {
+function viewPlaylist(id, count) {
+  const embed = `https://open.spotify.com/embed/playlist/${id}?t=${Date.now()}`;
   render(`
     <div class="card">
-      <h1>Hmm, couldn't read that</h1>
-      <div class="rec-reason">${escapeHtml(lastRaw || "(empty response)")}</div>
+      <p class="kicker">your picks</p>
+      <h1 class="pl-title">${count} tracks, picked for you</h1>
+      <iframe class="pl-embed" src="${embed}" loading="lazy"
+        allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>
+      <p class="pl-open"><a class="open-link" href="spotify:playlist:${id}">Open in Spotify ↗</a></p>
+      <p class="note">Reuses one private playlist (contents replaced each time), so nothing piles up in your library.</p>
     </div>
     <div class="below">
-      <button class="btn-ghost" id="again">Give me another</button>
-      <button class="link-btn logout" id="reset">Log out</button>
+      <button class="btn-ghost" id="again">Give me another set</button>
+      <div class="below-right">
+        <button class="link-btn" id="remove">Remove playlist</button>
+        <button class="link-btn" id="reset">Log out</button>
+      </div>
     </div>
   `);
-  wireAgain();
+  document.getElementById("again").onclick = regenerate;
+  document.getElementById("remove").onclick = removePlaylist;
   document.getElementById("reset").onclick = logout;
 }
 
-function wireAgain() {
-  const btn = document.getElementById("again");
-  if (btn) btn.onclick = nextTrack;
+function viewRemoved() {
+  render(`
+    <div class="card">
+      <h1>Removed</h1>
+      <p>That playlist was removed from your library.</p>
+    </div>
+    <div class="below">
+      <button class="btn-ghost" id="again">Make a new one</button>
+      <button class="link-btn logout" id="reset">Log out</button>
+    </div>
+  `);
+  document.getElementById("again").onclick = regenerate;
+  document.getElementById("reset").onclick = logout;
 }
 
 function escapeHtml(s) {
@@ -779,24 +788,26 @@ function escapeHtml(s) {
 /* ============================================================================
    Flow orchestration
    ========================================================================== */
-function showCurrent(autoplay) {
-  if (!recs.length) { viewRawFallback(); return; }
-  viewTrack(recs[recIndex], autoplay);
+function handleFlowError(e) {
+  if (e.message === "AUTH_EXPIRED" || e.message === "INSUFFICIENT_SCOPE") {
+    clearTokens();
+    viewLogin("This needs permission to manage a playlist — please reconnect Spotify.");
+    return;
+  }
+  viewError(e.message || String(e));
 }
 
-async function nextTrack() {
-  try {
-    recIndex++;
-    if (recIndex >= recs.length) await getRecommendations(); // fetch+enrich a new batch of 10
-    showCurrent(true); // user gesture → try to autoplay the preview
-  } catch (e) {
-    if (e.message === "AUTH_EXPIRED" || e.message === "INSUFFICIENT_SCOPE") {
-      clearTokens();
-      viewLogin("Please reconnect Spotify.");
-      return;
-    }
-    viewError(e.message || String(e));
-  }
+async function regenerate() {
+  try { await buildPlaylist(); }
+  catch (e) { handleFlowError(e); }
+}
+
+async function removePlaylist() {
+  const id = localStorage.getItem(LS.playlist);
+  try { if (id) await spotifyApi(`/playlists/${id}/followers`, { method: "DELETE" }); } // "delete" = unfollow
+  catch { /* already gone — fine */ }
+  localStorage.removeItem(LS.playlist);
+  viewRemoved();
 }
 
 async function boot() {
@@ -848,13 +859,12 @@ async function boot() {
       viewLoading("Reading your Spotify library…");
       await fetchLibrary();
     }
-    await getRecommendations();
-    showCurrent(false);
+    await buildPlaylist();
   } catch (e) {
     if (e.message === "AUTH_EXPIRED") { viewLogin(); return; }
     if (e.message === "INSUFFICIENT_SCOPE") {
       clearTokens();
-      viewLogin("This now reads your Liked Songs — please reconnect Spotify to grant access.");
+      viewLogin("Reconnect Spotify to grant the new access (library + playlist).");
       return;
     }
     viewError(e.message || String(e));
