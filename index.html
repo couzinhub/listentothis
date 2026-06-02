@@ -28,9 +28,9 @@
     justify-content: center;
     padding: 32px;
   }
+  #stage { width: 100%; max-width: 560px; }
   .card {
     width: 100%;
-    max-width: 560px;
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 18px;
@@ -76,14 +76,41 @@
   .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
 
   /* recommendation */
+  .rec-card { display: flex; gap: 22px; align-items: center; }
   .rec-cover {
-    display: block;
-    width: 168px;
-    height: 168px;
+    width: 200px;
+    height: 200px;
+    flex: none;
     object-fit: cover;
     border-radius: 14px;
     box-shadow: 0 12px 30px rgba(0,0,0,.45);
-    margin: 0 0 18px;
+  }
+  .rec-info { flex: 1; min-width: 0; }
+  .play-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 16px;
+    background: var(--accent);
+    color: #07120a;
+    border-radius: 999px;
+    padding: 11px 20px;
+    font-weight: 600;
+    font-size: 14px;
+    text-decoration: none;
+  }
+  .play-btn:hover { background: var(--accent-press); }
+  .below {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    margin-top: 18px;
+  }
+  .below .logout { align-self: flex-end; }
+  @media (max-width: 460px) {
+    .rec-card { flex-direction: column; align-items: flex-start; }
+    .rec-cover { width: 100%; height: auto; aspect-ratio: 1 / 1; }
   }
   .rec-type {
     display: inline-block;
@@ -97,7 +124,7 @@
     margin-bottom: 14px;
   }
   .rec-name { font-size: 28px; font-weight: 700; line-height: 1.18; margin: 0 0 4px; }
-  .rec-artist { color: var(--muted); margin: 0 0 18px; font-size: 16px; }
+  .rec-artist { color: var(--muted); margin: 0; font-size: 16px; }
   .rec-reason {
     color: var(--text);
     background: var(--panel-2);
@@ -162,7 +189,7 @@
 </style>
 </head>
 <body>
-  <main class="card" id="card">
+  <main id="stage">
     <!-- views are swapped in by JS -->
   </main>
 
@@ -222,15 +249,15 @@ const LS = {
   expiry: "ltt_spotify_expiry",
   verifier: "ltt_pkce_verifier",
   state: "ltt_oauth_state",
+  library: "ltt_library_v1", // cached taste profile (JSON), so we don't re-read Spotify every load
 };
 
 /* ----------------------------- DOM helper ------------------------------- */
-const card = document.getElementById("card");
-function render(html) { card.innerHTML = html; }
+const stage = document.getElementById("stage");
+function render(html) { stage.innerHTML = html; }
 
 /* In-memory state for the session */
-let tasteProfile = null;       // cached system text built from Spotify data
-let tasteSummary = null;       // short {artists:[], tracks:[]} for display
+let library = null;            // cached pool of saved tracks + genres (see fetchLibrary)
 const previousRecs = [];       // names already suggested, to avoid repeats
 
 /* ============================================================================
@@ -369,9 +396,9 @@ async function spotifyGet(path) {
   return res.json();
 }
 
-async function fetchTasteData() {
+async function fetchLibrary() {
   const PAGE = 50;
-  const TARGET = 600; // tracks to sample for the profile
+  const POOL_TARGET = 1500; // tracks to keep in the cached pool
 
   // First page tells us how big the library is.
   const first = await spotifyGet(`/me/tracks?limit=${PAGE}&offset=0`);
@@ -380,7 +407,7 @@ async function fetchTasteData() {
   // Sample pages spread evenly across the WHOLE library. /me/tracks is
   // newest-first, so reading only the front would reintroduce recency bias —
   // instead we step across the full offset range.
-  const pagesNeeded = Math.max(1, Math.min(Math.ceil(TARGET / PAGE), Math.ceil(total / PAGE)));
+  const pagesNeeded = Math.max(1, Math.min(Math.ceil(POOL_TARGET / PAGE), Math.ceil(total / PAGE)));
   const lastOffset = Math.max(0, total - PAGE);
   const offsets = new Set([0]);
   for (let i = 1; i < pagesNeeded; i++) {
@@ -388,72 +415,103 @@ async function fetchTasteData() {
     offsets.add(raw - (raw % PAGE)); // align to a page boundary
   }
 
+  // Fetch remaining pages in small concurrent batches (stay clear of rate limits).
   const pages = [first];
   const others = [...offsets].filter((o) => o !== 0);
-  if (others.length) {
-    pages.push(...(await Promise.all(others.map((o) => spotifyGet(`/me/tracks?limit=${PAGE}&offset=${o}`)))));
+  for (let i = 0; i < others.length; i += 6) {
+    const chunk = others.slice(i, i + 6);
+    pages.push(...(await Promise.all(chunk.map((o) => spotifyGet(`/me/tracks?limit=${PAGE}&offset=${o}`)))));
   }
 
-  // Flatten to tracks, de-duped by id.
+  // De-dupe into a pool of { name, artists[] }, and tally artist frequency by id.
   const seen = new Set();
-  const items = [];
+  const pool = [];
+  const artistFreq = new Map(); // id -> { name, count }
   for (const p of pages) {
     for (const it of p.items || []) {
       const t = it.track;
-      if (t && t.id && !seen.has(t.id)) { seen.add(t.id); items.push(t); }
+      if (!t || !t.id || seen.has(t.id)) continue;
+      seen.add(t.id);
+      pool.push({ name: t.name, artists: (t.artists || []).map((a) => a.name) });
+      (t.artists || []).forEach((a) => {
+        if (!a.id) return;
+        const e = artistFreq.get(a.id) || { name: a.name, count: 0 };
+        e.count++;
+        artistFreq.set(a.id, e);
+      });
     }
   }
 
-  // Aggregate artist frequency across the sample + collect track titles.
-  const artistCount = new Map(); // id -> { name, count }
-  const tracks = [];
-  for (const t of items) {
-    (t.artists || []).forEach((a) => {
-      if (!a.id) return;
-      const e = artistCount.get(a.id) || { name: a.name, count: 0 };
-      e.count++;
-      artistCount.set(a.id, e);
-    });
-    tracks.push({ name: t.name, artist: (t.artists || []).map((x) => x.name).join(", ") });
-  }
-
-  const topArtists = [...artistCount.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 50);
-
-  // Genres live on the artist object, not the track — fetch them in one batch.
-  const ids = topArtists.map(([id]) => id).slice(0, 50);
-  const genreById = {};
-  if (ids.length) {
+  // Genres live on the artist object — fetch them for the most-frequent artists
+  // (the ones most likely to surface in any random sample). 1-2 batched calls.
+  const topIds = [...artistFreq.entries()]
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, 100)
+    .map(([id]) => id);
+  const genreByName = {};
+  for (let i = 0; i < topIds.length; i += 50) {
     try {
-      const ar = await spotifyGet("/artists?ids=" + ids.join(","));
-      (ar.artists || []).forEach((a) => { if (a) genreById[a.id] = a.genres || []; });
+      const ar = await spotifyGet("/artists?ids=" + topIds.slice(i, i + 50).join(","));
+      (ar.artists || []).forEach((a) => { if (a && a.genres && a.genres.length) genreByName[a.name] = a.genres; });
     } catch { /* genres are a nice-to-have */ }
   }
 
-  const genreCount = new Map();
-  topArtists.forEach(([id, e]) =>
-    (genreById[id] || []).forEach((g) => genreCount.set(g, (genreCount.get(g) || 0) + e.count))
+  library = { pool, genreByName, libraryTotal: total };
+  saveLibraryCache();
+}
+
+// Build the prompt text from a NEW random sample of the cached pool, so every
+// recommendation draws on a different slice of the library.
+function buildTasteProfile() {
+  const { pool, genreByName, libraryTotal } = library;
+  const SAMPLE = 600;
+
+  // Partial Fisher–Yates shuffle, then take the first SAMPLE entries.
+  const idx = pool.map((_, i) => i);
+  for (let i = idx.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [idx[i], idx[j]] = [idx[j], idx[i]];
+  }
+  const sample = idx.slice(0, Math.min(SAMPLE, pool.length)).map((i) => pool[i]);
+
+  // Artist frequency within this sample.
+  const count = new Map();
+  sample.forEach((t) => t.artists.forEach((n) => count.set(n, (count.get(n) || 0) + 1)));
+  const topArtists = [...count.entries()].sort((a, b) => b[1] - a[1]).slice(0, 40);
+
+  // Dominant genres from the cached genre map.
+  const gCount = new Map();
+  topArtists.forEach(([n, c]) => (genreByName[n] || []).forEach((g) => gCount.set(g, (gCount.get(g) || 0) + c)));
+  const topGenres = [...gCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([g]) => g);
+
+  const artistLines = topArtists.map(([n, c], i) =>
+    `${i + 1}. ${n} — ${c} track${c === 1 ? "" : "s"}` + (genreByName[n] ? " — " + genreByName[n].join(", ") : "")
   );
-  const topGenres = [...genreCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([g]) => g);
+  const trackLines = sample.slice(0, 30).map((t, i) => `${i + 1}. ${t.name} — ${t.artists.join(", ")}`);
 
-  // An evenly-spread sample of track titles.
-  const sampleTracks = [];
-  const step = Math.max(1, Math.floor(tracks.length / 30));
-  for (let i = 0; i < tracks.length && sampleTracks.length < 30; i += step) sampleTracks.push(tracks[i]);
-
-  tasteSummary = { libraryTotal: total, sampled: items.length };
-
-  const artistLines = topArtists.slice(0, 40).map(([id, e], i) =>
-    `${i + 1}. ${e.name} — ${e.count} saved track${e.count === 1 ? "" : "s"}` +
-    ((genreById[id] && genreById[id].length) ? " — " + genreById[id].join(", ") : "")
-  );
-  const trackLines = sampleTracks.map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`);
-
-  tasteProfile =
-    `LISTENER'S SAVED LIBRARY (Spotify) — ${total} saved tracks total; ` +
-    `${items.length} sampled evenly across the whole library (not just recent saves).\n\n` +
-    "Most-saved artists (with genres):\n" + artistLines.join("\n") +
+  return `LISTENER'S SAVED LIBRARY (Spotify) — ${libraryTotal} saved tracks total.\n\n` +
+    "Most-saved artists in this slice (with genres):\n" + artistLines.join("\n") +
     "\n\nDominant genres: " + (topGenres.length ? topGenres.join(", ") : "(unavailable)") +
-    "\n\nA spread of tracks from across the library:\n" + trackLines.join("\n");
+    "\n\nA spread of tracks from the library:\n" + trackLines.join("\n");
+}
+
+/* ============================================================================
+   Library cache — store the pool as JSON in localStorage so we don't re-read
+   the whole Spotify library on every load. (A static site can't write a
+   server-side file; this is the browser-side equivalent. Logging out clears it.)
+   ========================================================================== */
+function saveLibraryCache() {
+  try { localStorage.setItem(LS.library, JSON.stringify(library)); }
+  catch { /* storage full/unavailable — caching is best-effort */ }
+}
+
+function loadLibraryCache() {
+  try {
+    const c = JSON.parse(localStorage.getItem(LS.library) || "null");
+    if (!c || !Array.isArray(c.pool) || !c.pool.length) return false;
+    library = c;
+    return true;
+  } catch { return false; }
 }
 
 // Look up cover art + a direct Spotify link for the recommendation (search needs
@@ -468,11 +526,12 @@ async function fetchCover(rec) {
     if (item) {
       return {
         imageUrl: (item.images && item.images[0] && item.images[0].url) || "",
-        spotifyUrl: (item.external_urls && item.external_urls.spotify) || "",
+        webUrl: (item.external_urls && item.external_urls.spotify) || "",
+        uri: item.uri || "", // spotify:album:... / spotify:artist:... → opens the desktop app
       };
     }
   } catch { /* fall back to a plain search link below */ }
-  return { imageUrl: "", spotifyUrl: "" };
+  return { imageUrl: "", webUrl: "", uri: "" };
 }
 
 /* ============================================================================
@@ -493,10 +552,13 @@ const SYSTEM_INSTRUCTIONS =
   "Respond with ONLY a JSON object — no markdown, no code fence, no preamble — in " +
   'exactly this shape:\n' +
   '{"name": "<album or artist name>", "type": "album" | "artist", ' +
-  '"artist": "<the artist name, for searching>", ' +
-  '"reasoning": "<2-3 sentences connecting it to their taste>"}';
+  '"artist": "<the artist name, for searching>"}';
 
 async function getRecommendation() {
+  // Fresh random sample of the cached library on every call → different slice,
+  // different recommendation. (The block varies, so it isn't prompt-cached.)
+  const tasteProfile = buildTasteProfile();
+
   const avoidClause = previousRecs.length
     ? "\n\nDo NOT recommend any of these (already suggested) — pick something different:\n- " +
       previousRecs.join("\n- ")
@@ -508,9 +570,7 @@ async function getRecommendation() {
     temperature: 1, // variety across repeated "give me another" calls
     system: [
       { type: "text", text: SYSTEM_INSTRUCTIONS },
-      // The taste profile is identical across a session's repeat calls, so cache
-      // it — every "give me another" then reads it at ~0.1x input cost.
-      { type: "text", text: tasteProfile, cache_control: { type: "ephemeral" } },
+      { type: "text", text: tasteProfile },
     ],
     messages: [
       { role: "user", content: "Give me one recommendation for this listener." + avoidClause },
@@ -556,13 +616,15 @@ function parseRecJSON(text) {
    ========================================================================== */
 function viewLogin(note) {
   render(`
-    <p class="kicker">listen to this</p>
-    <h1>One album. Picked for your ears.</h1>
-    <p>Connect Spotify and Claude will study your saved library, then hand you a
-       single off-the-radar recommendation — with a short note on why it fits.</p>
-    ${note ? `<div class="error">${escapeHtml(note)}</div>` : ""}
-    <div class="row">
-      <button class="btn-primary" id="login">Connect Spotify</button>
+    <div class="card">
+      <p class="kicker">listen to this</p>
+      <h1>One album. Picked for your ears.</h1>
+      <p>Connect Spotify and Claude will study your saved library, then hand you a
+         single off-the-radar recommendation — with a short note on why it fits.</p>
+      ${note ? `<div class="error">${escapeHtml(note)}</div>` : ""}
+      <div class="row">
+        <button class="btn-primary" id="login">Connect Spotify</button>
+      </div>
     </div>
   `);
   document.getElementById("login").onclick = () => {
@@ -576,19 +638,23 @@ function viewLogin(note) {
 
 function viewLoading(message) {
   render(`
-    <p class="kicker">listen to this</p>
-    <div class="loading-row"><div class="spinner"></div><span>${message}</span></div>
+    <div class="card">
+      <p class="kicker">listen to this</p>
+      <div class="loading-row"><div class="spinner"></div><span>${message}</span></div>
+    </div>
   `);
 }
 
 function viewError(message) {
   render(`
-    <p class="kicker">listen to this</p>
-    <h1>Something went sideways</h1>
-    <div class="error">${escapeHtml(message)}</div>
-    <div class="row">
-      <button class="btn-ghost" id="retry">Try again</button>
-      <button class="link-btn" id="reset">Reset &amp; log out</button>
+    <div class="card">
+      <p class="kicker">listen to this</p>
+      <h1>Something went sideways</h1>
+      <div class="error">${escapeHtml(message)}</div>
+      <div class="row">
+        <button class="btn-ghost" id="retry">Try again</button>
+        <button class="link-btn" id="reset">Reset &amp; log out</button>
+      </div>
     </div>
   `);
   document.getElementById("retry").onclick = boot;
@@ -596,45 +662,49 @@ function viewError(message) {
 }
 
 function viewRecommendation(rec, raw, cover) {
-  cover = cover || { imageUrl: "", spotifyUrl: "" };
+  cover = cover || { imageUrl: "", webUrl: "", uri: "" };
 
   if (!rec) {
     // Parsing failed — show Claude's raw text so nothing is hidden from the user.
     render(`
-      <p class="kicker">listen to this</p>
-      <h1>Here's what Claude said</h1>
-      <div class="rec-reason">${escapeHtml(raw || "(empty response)")}</div>
-      <div class="row">
-        <button class="btn-primary" id="again">Give me another</button>
+      <div class="card">
+        <h1>Here's what Claude said</h1>
+        <div class="rec-reason">${escapeHtml(raw || "(empty response)")}</div>
+      </div>
+      <div class="below">
+        <button class="btn-ghost" id="again">Give me another</button>
+        <button class="link-btn logout" id="reset">Log out</button>
       </div>
     `);
     wireAgain();
+    document.getElementById("reset").onclick = logout;
     return;
   }
 
+  // Prefer the spotify: URI so it opens the desktop app if installed; fall back
+  // to the web URL, then a search link. URIs are protocol handlers — opening them
+  // in a new tab would leave a blank tab, so only web links get target=_blank.
   const fallbackSearch = "https://open.spotify.com/search/" + encodeURIComponent(
     rec.type === "album" && rec.artist ? `${rec.artist} ${rec.name}` : rec.name
   );
-  const link = cover.spotifyUrl || fallbackSearch;
-  const libCount = (tasteSummary && tasteSummary.libraryTotal || 0).toLocaleString();
+  const playHref = cover.uri || cover.webUrl || fallbackSearch;
+  const targetAttr = playHref.startsWith("spotify:") ? "" : ` target="_blank" rel="noopener"`;
 
   render(`
-    <p class="kicker">a recommendation for you</p>
-    ${cover.imageUrl
-      ? `<img class="rec-cover" src="${cover.imageUrl}" alt="${escapeHtml(rec.name)} cover art" />`
-      : ""}
-    <span class="rec-type">${escapeHtml(rec.type || "pick")}</span>
-    <h2 class="rec-name">${escapeHtml(rec.name)}</h2>
-    ${rec.artist && rec.artist !== rec.name
-      ? `<p class="rec-artist">${escapeHtml(rec.artist)}</p>` : ""}
-    <div class="rec-reason">${escapeHtml(rec.reasoning || "")}</div>
-    <a class="spotify-link" href="${link}" target="_blank" rel="noopener">▶ Open in Spotify</a>
-    <div class="row" style="margin-top:24px;">
-      <button class="btn-primary" id="again">Give me another</button>
+    <div class="card rec-card">
+      ${cover.imageUrl
+        ? `<img class="rec-cover" src="${cover.imageUrl}" alt="${escapeHtml(rec.name)} cover art" />`
+        : ""}
+      <div class="rec-info">
+        <h2 class="rec-name">${escapeHtml(rec.name)}</h2>
+        ${rec.artist && rec.artist !== rec.name
+          ? `<p class="rec-artist">${escapeHtml(rec.artist)}</p>` : ""}
+        <a class="play-btn" href="${playHref}"${targetAttr}>▶ Play</a>
+      </div>
     </div>
-    <div class="meta">
-      <span>Based on your library of ${libCount} saved tracks</span>
-      <button class="link-btn" id="reset">Log out</button>
+    <div class="below">
+      <button class="btn-ghost" id="again">Give me another</button>
+      <button class="link-btn logout" id="reset">Log out</button>
     </div>
   `);
   wireAgain();
@@ -708,11 +778,11 @@ async function boot() {
     if (!refreshed) { viewLogin(); return; }
   }
 
-  // Authenticated → fetch data (once) and get the first recommendation
+  // Authenticated → load the library (from cache if available) once, then recommend
   try {
-    if (!tasteProfile) {
+    if (!library && !loadLibraryCache()) {
       viewLoading("Reading your Spotify library…");
-      await fetchTasteData();
+      await fetchLibrary();
     }
     await requestAndShow();
   } catch (e) {
