@@ -416,14 +416,13 @@ async function spotifyApi(path, { method = "GET", body } = {}) {
     const detail = (await res.text()).slice(0, 400);
     const granted = localStorage.getItem(LS.scope) || "(unknown)";
     throw new Error(
-      "Spotify refused this request (403 — usually a missing permission).\n\n" +
+      "Spotify refused this request (403) on:\n  " + method + " " + path + "\n\n" +
       "Scopes your last login granted: " + granted + "\n" +
       "Scopes needed: user-library-read playlist-modify-private\n\n" +
-      "Fix: tap “Reset & log out” below, then reconnect Spotify and approve the access.\n\n" +
       "Spotify said: " + (detail || "(no details)")
     );
   }
-  if (!res.ok) throw new Error("Spotify API error (" + res.status + "): " + (await res.text()));
+  if (!res.ok) throw new Error("Spotify API error " + res.status + " on " + method + " " + path + ": " + (await res.text()));
 
   const text = await res.text(); // some write endpoints return an empty body
   return text ? JSON.parse(text) : {};
@@ -666,13 +665,12 @@ function parseTracks(text) {
 // with "Give me another" is instant (no per-track network wait).
 // Get (or create) the single reusable scratch playlist; returns its id.
 async function ensurePlaylist() {
+  // Reuse the stored playlist if we have one. (We intentionally DON'T GET it to
+  // verify — reading a private playlist needs playlist-read-private, which we
+  // don't request; a stale/deleted id will surface on the PUT instead.)
   const existing = localStorage.getItem(LS.playlist);
-  if (existing) {
-    try {
-      const pl = await spotifyApi(`/playlists/${existing}?fields=id`);
-      if (pl && pl.id) return pl.id;
-    } catch { /* unfollowed/deleted — make a fresh one */ }
-  }
+  if (existing) return existing;
+
   const me = await spotifyApi("/me");
   const created = await spotifyApi(`/users/${me.id}/playlists`, {
     method: "POST",
