@@ -100,6 +100,12 @@
     text-decoration: none;
   }
   .play-btn:hover { background: var(--accent-press); }
+  .play-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-top: 16px; }
+  .play-row .play-btn { margin-top: 0; }
+  .open-link { color: var(--muted); font-size: 13px; text-decoration: none; }
+  .open-link:hover { color: var(--text); text-decoration: underline; }
+  .note { color: var(--muted); font-size: 12.5px; margin: 12px 0 0; line-height: 1.45; }
+  audio#preview { display: none; }
   .below {
     display: flex;
     flex-direction: column;
@@ -258,7 +264,10 @@ function render(html) { stage.innerHTML = html; }
 
 /* In-memory state for the session */
 let library = null;            // cached pool of saved tracks + genres (see fetchLibrary)
-const previousRecs = [];       // names already suggested, to avoid repeats
+let recs = [];                 // current batch of enriched track recommendations
+let recIndex = 0;              // index of the one being shown
+let lastRaw = "";              // last raw Claude text (parse-failure fallback)
+const previousRecs = [];       // track names already suggested, to avoid repeats
 
 /* ============================================================================
    PKCE helpers
@@ -514,24 +523,31 @@ function loadLibraryCache() {
   } catch { return false; }
 }
 
-// Look up cover art + a direct Spotify link for the recommendation (search needs
-// no special scope). Falls back to no image / a search link if nothing matches.
-async function fetchCover(rec) {
+// Find a Claude-suggested {track, artist} on Spotify: cover art, the 30s preview
+// (often null for new apps — Spotify deprecated preview_url in Nov 2024), the
+// spotify:track: URI (plays the full song in the desktop app), and a web link.
+async function enrichTrack(t) {
+  const track = t.track || t.name || "";
+  const artist = t.artist || "";
+  const result = {
+    track, artist, found: false, name: "", artistName: "",
+    imageUrl: "", previewUrl: "", uri: "", webUrl: "",
+  };
+  if (!track) return result;
   try {
-    const type = rec.type === "album" ? "album" : "artist";
-    const q = type === "album" && rec.artist && rec.artist !== rec.name
-      ? `${rec.artist} ${rec.name}` : rec.name;
-    const data = await spotifyGet(`/search?q=${encodeURIComponent(q)}&type=${type}&limit=1`);
-    const item = type === "album" ? data.albums?.items?.[0] : data.artists?.items?.[0];
+    const data = await spotifyGet(`/search?q=${encodeURIComponent(track + " " + artist)}&type=track&limit=1`);
+    const item = data.tracks && data.tracks.items && data.tracks.items[0];
     if (item) {
-      return {
-        imageUrl: (item.images && item.images[0] && item.images[0].url) || "",
-        webUrl: (item.external_urls && item.external_urls.spotify) || "",
-        uri: item.uri || "", // spotify:album:... / spotify:artist:... → opens the desktop app
-      };
+      result.found = true;
+      result.name = item.name;
+      result.artistName = (item.artists || []).map((a) => a.name).join(", ");
+      result.imageUrl = (item.album && item.album.images && item.album.images[0] && item.album.images[0].url) || "";
+      result.previewUrl = item.preview_url || "";
+      result.uri = item.uri || "";
+      result.webUrl = (item.external_urls && item.external_urls.spotify) || "";
     }
-  } catch { /* fall back to a plain search link below */ }
-  return { imageUrl: "", webUrl: "", uri: "" };
+  } catch { /* leave as not-found; we still show Claude's text + a search link */ }
+  return result;
 }
 
 /* ============================================================================
@@ -545,35 +561,32 @@ const SYSTEM_INSTRUCTIONS =
   "genres, eras, scenes, and the long tail of music. You will be given a listener's " +
   "taste profile. Analyze it for patterns: genre, mood, era, instrumentation, " +
   "production style, and how obscure vs. mainstream their taste runs. Then recommend " +
-  "exactly ONE specific album or artist they most likely have NOT already heard. " +
-  "Avoid obvious or mainstream suggestions, and avoid anything that merely duplicates " +
-  "what they already listen to — make a thoughtful lateral move that genuinely fits " +
-  "the through-line of their taste.\n\n" +
+  "EXACTLY 10 specific TRACKS (individual songs) they most likely have NOT already " +
+  "heard. Avoid obvious or mainstream picks and anything already in their library — " +
+  "favor thoughtful, lateral choices that fit the through-line of their taste, with a " +
+  "little variety across the ten.\n\n" +
   "Respond with ONLY a JSON object — no markdown, no code fence, no preamble — in " +
   'exactly this shape:\n' +
-  '{"name": "<album or artist name>", "type": "album" | "artist", ' +
-  '"artist": "<the artist name, for searching>"}';
+  '{"tracks": [{"track": "<song title>", "artist": "<artist name>"}, ... 10 items]}';
 
-async function getRecommendation() {
-  // Fresh random sample of the cached library on every call → different slice,
-  // different recommendation. (The block varies, so it isn't prompt-cached.)
+async function askClaudeForTracks() {
+  // Fresh random sample of the cached library each call → a different slice.
   const tasteProfile = buildTasteProfile();
 
   const avoidClause = previousRecs.length
-    ? "\n\nDo NOT recommend any of these (already suggested) — pick something different:\n- " +
-      previousRecs.join("\n- ")
+    ? "\n\nDo NOT recommend any of these already-suggested tracks:\n- " + previousRecs.join("\n- ")
     : "";
 
   const requestBody = {
     model: CLAUDE_MODEL,
     max_tokens: 1024,
-    temperature: 1, // variety across repeated "give me another" calls
+    temperature: 1, // variety across batches
     system: [
       { type: "text", text: SYSTEM_INSTRUCTIONS },
       { type: "text", text: tasteProfile },
     ],
     messages: [
-      { role: "user", content: "Give me one recommendation for this listener." + avoidClause },
+      { role: "user", content: "Recommend 10 tracks for this listener." + avoidClause },
     ],
   };
 
@@ -594,21 +607,48 @@ async function getRecommendation() {
 
   const data = await res.json();
   const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
-  const rec = parseRecJSON(text);
-  if (rec && rec.name) previousRecs.push(rec.name);
-  return { rec, raw: text };
+  const tracks = parseTracks(text);
+
+  // Remember what we've shown so later batches don't repeat (bounded).
+  tracks.forEach((t) => { const n = t.track || t.name; if (n) previousRecs.push(n); });
+  if (previousRecs.length > 80) previousRecs.splice(0, previousRecs.length - 80);
+
+  return { tracks, raw: text };
 }
 
-function parseRecJSON(text) {
-  // Tolerant: grab the outermost {...} in case the model adds stray text.
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start === -1 || end === -1) return null;
+function parseTracks(text) {
+  // Pull the outermost JSON object/array even if the model adds stray text.
   try {
-    return JSON.parse(text.slice(start, end + 1));
-  } catch {
-    return null;
+    const s = text.indexOf("{"), e = text.lastIndexOf("}");
+    if (s !== -1 && e !== -1) {
+      const obj = JSON.parse(text.slice(s, e + 1));
+      if (Array.isArray(obj.tracks)) return obj.tracks;
+      if (Array.isArray(obj)) return obj;
+    }
+  } catch { /* try array form */ }
+  try {
+    const a = text.indexOf("["), b = text.lastIndexOf("]");
+    if (a !== -1 && b !== -1) {
+      const arr = JSON.parse(text.slice(a, b + 1));
+      if (Array.isArray(arr)) return arr;
+    }
+  } catch { /* give up */ }
+  return [];
+}
+
+// Fetch a fresh batch of 10 and enrich them all on Spotify, so cycling through
+// with "Give me another" is instant (no per-track network wait).
+async function getRecommendations() {
+  viewLoading("Finding tracks that fit your taste…");
+  const { tracks, raw } = await askClaudeForTracks();
+  lastRaw = raw;
+  if (tracks.length) {
+    viewLoading("Looking them up on Spotify…");
+    recs = await Promise.all(tracks.map(enrichTrack));
+  } else {
+    recs = [];
   }
+  recIndex = 0;
 }
 
 /* ============================================================================
@@ -618,9 +658,9 @@ function viewLogin(note) {
   render(`
     <div class="card">
       <p class="kicker">listen to this</p>
-      <h1>One album. Picked for your ears.</h1>
-      <p>Connect Spotify and Claude will study your saved library, then hand you a
-         single off-the-radar recommendation — with a short note on why it fits.</p>
+      <h1>One track at a time. Picked for your ears.</h1>
+      <p>Connect Spotify and Claude will study your saved library, then surface tracks
+         you probably haven't heard — one at a time, with a preview when available.</p>
       ${note ? `<div class="error">${escapeHtml(note)}</div>` : ""}
       <div class="row">
         <button class="btn-primary" id="login">Connect Spotify</button>
@@ -661,46 +701,61 @@ function viewError(message) {
   document.getElementById("reset").onclick = logout;
 }
 
-function viewRecommendation(rec, raw, cover) {
-  cover = cover || { imageUrl: "", webUrl: "", uri: "" };
+function viewTrack(rec, autoplay) {
+  const title = (rec.found && rec.name) ? rec.name : rec.track;
+  const artist = (rec.found && rec.artistName) ? rec.artistName : rec.artist;
 
-  if (!rec) {
-    // Parsing failed — show Claude's raw text so nothing is hidden from the user.
-    render(`
-      <div class="card">
-        <h1>Here's what Claude said</h1>
-        <div class="rec-reason">${escapeHtml(raw || "(empty response)")}</div>
-      </div>
-      <div class="below">
-        <button class="btn-ghost" id="again">Give me another</button>
-        <button class="link-btn logout" id="reset">Log out</button>
-      </div>
-    `);
-    wireAgain();
-    document.getElementById("reset").onclick = logout;
-    return;
-  }
+  // Prefer spotify:track: (opens & plays in the desktop app); fall back to the
+  // web link, then a search. URIs are protocol handlers, so don't open a new tab.
+  const searchFallback = "https://open.spotify.com/search/" +
+    encodeURIComponent(`${rec.track} ${rec.artist}`);
+  const spotHref = rec.uri || rec.webUrl || searchFallback;
+  const tgt = spotHref.startsWith("spotify:") ? "" : ` target="_blank" rel="noopener"`;
 
-  // Prefer the spotify: URI so it opens the desktop app if installed; fall back
-  // to the web URL, then a search link. URIs are protocol handlers — opening them
-  // in a new tab would leave a blank tab, so only web links get target=_blank.
-  const fallbackSearch = "https://open.spotify.com/search/" + encodeURIComponent(
-    rec.type === "album" && rec.artist ? `${rec.artist} ${rec.name}` : rec.name
-  );
-  const playHref = cover.uri || cover.webUrl || fallbackSearch;
-  const targetAttr = playHref.startsWith("spotify:") ? "" : ` target="_blank" rel="noopener"`;
+  const actions = rec.previewUrl
+    ? `<button class="play-btn" id="play">▶ Play preview</button>` +
+      `<a class="open-link" href="${spotHref}"${tgt}>Open in Spotify ↗</a>`
+    : `<a class="play-btn" href="${spotHref}"${tgt}>▶ Play in Spotify</a>`;
 
   render(`
     <div class="card rec-card">
-      ${cover.imageUrl
-        ? `<img class="rec-cover" src="${cover.imageUrl}" alt="${escapeHtml(rec.name)} cover art" />`
+      ${rec.imageUrl
+        ? `<img class="rec-cover" src="${rec.imageUrl}" alt="${escapeHtml(title)} cover art" />`
         : ""}
       <div class="rec-info">
-        <h2 class="rec-name">${escapeHtml(rec.name)}</h2>
-        ${rec.artist && rec.artist !== rec.name
-          ? `<p class="rec-artist">${escapeHtml(rec.artist)}</p>` : ""}
-        <a class="play-btn" href="${playHref}"${targetAttr}>▶ Play</a>
+        <h2 class="rec-name">${escapeHtml(title)}</h2>
+        <p class="rec-artist">${escapeHtml(artist)}</p>
+        <div class="play-row">${actions}</div>
+        ${rec.previewUrl
+          ? `<audio id="preview" src="${rec.previewUrl}" preload="auto"></audio>`
+          : `<p class="note">No 30-second preview for this track (Spotify limits previews for newer apps) — Play opens it in Spotify.</p>`}
       </div>
+    </div>
+    <div class="below">
+      <button class="btn-ghost" id="again">Give me another</button>
+      <button class="link-btn logout" id="reset">Log out</button>
+    </div>
+  `);
+
+  wireAgain();
+  document.getElementById("reset").onclick = logout;
+
+  const audio = document.getElementById("preview");
+  const playBtn = document.getElementById("play");
+  if (audio && playBtn) {
+    playBtn.onclick = () => { audio.paused ? audio.play() : audio.pause(); };
+    audio.onplay = () => { playBtn.textContent = "⏸ Pause preview"; };
+    audio.onpause = () => { playBtn.textContent = "▶ Play preview"; };
+    audio.onended = () => { playBtn.textContent = "▶ Play preview"; };
+    if (autoplay) audio.play().catch(() => { /* autoplay may be blocked — fine */ });
+  }
+}
+
+function viewRawFallback() {
+  render(`
+    <div class="card">
+      <h1>Hmm, couldn't read that</h1>
+      <div class="rec-reason">${escapeHtml(lastRaw || "(empty response)")}</div>
     </div>
     <div class="below">
       <button class="btn-ghost" id="again">Give me another</button>
@@ -713,7 +768,7 @@ function viewRecommendation(rec, raw, cover) {
 
 function wireAgain() {
   const btn = document.getElementById("again");
-  if (btn) btn.onclick = requestAndShow;
+  if (btn) btn.onclick = nextTrack;
 }
 
 function escapeHtml(s) {
@@ -724,13 +779,22 @@ function escapeHtml(s) {
 /* ============================================================================
    Flow orchestration
    ========================================================================== */
-async function requestAndShow() {
-  viewLoading("Consulting Claude…");
+function showCurrent(autoplay) {
+  if (!recs.length) { viewRawFallback(); return; }
+  viewTrack(recs[recIndex], autoplay);
+}
+
+async function nextTrack() {
   try {
-    const { rec, raw } = await getRecommendation();
-    const cover = rec && rec.name ? await fetchCover(rec) : { imageUrl: "", spotifyUrl: "" };
-    viewRecommendation(rec, raw, cover);
+    recIndex++;
+    if (recIndex >= recs.length) await getRecommendations(); // fetch+enrich a new batch of 10
+    showCurrent(true); // user gesture → try to autoplay the preview
   } catch (e) {
+    if (e.message === "AUTH_EXPIRED" || e.message === "INSUFFICIENT_SCOPE") {
+      clearTokens();
+      viewLogin("Please reconnect Spotify.");
+      return;
+    }
     viewError(e.message || String(e));
   }
 }
@@ -784,7 +848,8 @@ async function boot() {
       viewLoading("Reading your Spotify library…");
       await fetchLibrary();
     }
-    await requestAndShow();
+    await getRecommendations();
+    showCurrent(false);
   } catch (e) {
     if (e.message === "AUTH_EXPIRED") { viewLogin(); return; }
     if (e.message === "INSUFFICIENT_SCOPE") {
