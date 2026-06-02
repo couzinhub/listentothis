@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>listen to this — a single recommendation, picked for you</title>
+<style>
+  :root {
+    --bg: #0e0f13;
+    --panel: #16181f;
+    --panel-2: #1d2029;
+    --text: #f3f3f1;
+    --muted: #9aa0ad;
+    --accent: #1db954;
+    --accent-press: #169c46;
+    --border: #2a2e3a;
+    --danger: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: radial-gradient(1200px 600px at 50% -10%, #1a1d27 0%, var(--bg) 55%);
+    color: var(--text);
+    font: 16px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+  }
+  .card {
+    width: 100%;
+    max-width: 560px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    padding: 36px 34px 30px;
+    box-shadow: 0 30px 80px rgba(0,0,0,.45);
+  }
+  .kicker {
+    font-size: 12px;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 6px;
+  }
+  h1 {
+    font-size: 26px;
+    line-height: 1.2;
+    margin: 0 0 18px;
+    font-weight: 650;
+  }
+  p { color: var(--muted); margin: 0 0 18px; }
+
+  button {
+    appearance: none;
+    border: none;
+    border-radius: 999px;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 13px 22px;
+    transition: background .15s ease, transform .05s ease, opacity .15s ease;
+  }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: .55; cursor: default; }
+  .btn-primary { background: var(--accent); color: #07120a; }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-press); }
+  .btn-ghost {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-ghost:hover:not(:disabled) { background: var(--panel-2); }
+
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+
+  /* recommendation */
+  .rec-type {
+    display: inline-block;
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid rgba(29,185,84,.4);
+    border-radius: 999px;
+    padding: 3px 11px;
+    margin-bottom: 14px;
+  }
+  .rec-name { font-size: 28px; font-weight: 700; line-height: 1.18; margin: 0 0 4px; }
+  .rec-artist { color: var(--muted); margin: 0 0 18px; font-size: 16px; }
+  .rec-reason {
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin: 0 0 22px;
+    font-size: 15.5px;
+    line-height: 1.6;
+  }
+  a.spotify-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  a.spotify-link:hover { text-decoration: underline; }
+
+  .meta {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+  }
+  .link-btn {
+    background: none; border: none; color: var(--muted);
+    padding: 0; font: inherit; font-size: 13px; cursor: pointer; text-decoration: underline;
+  }
+  .link-btn:hover { color: var(--text); }
+
+  .spinner {
+    width: 22px; height: 22px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading-row { display: flex; align-items: center; gap: 14px; color: var(--muted); }
+
+  .error {
+    background: rgba(255,107,107,.08);
+    border: 1px solid rgba(255,107,107,.35);
+    color: #ffc9c9;
+    border-radius: 12px;
+    padding: 14px 16px;
+    font-size: 14px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0 0 18px;
+  }
+  .hidden { display: none !important; }
+  code { background: var(--panel-2); padding: 1px 6px; border-radius: 6px; font-size: 13px; }
+</style>
+</head>
+<body>
+  <main class="card" id="card">
+    <!-- views are swapped in by JS -->
+  </main>
+
+<script>
+/* ============================================================================
+   CONFIGURATION
+   ----------------------------------------------------------------------------
+   SPOTIFY_CLIENT_ID:  from https://developer.spotify.com/dashboard. It's public
+                       (PKCE has no client secret). Save it in the lovelyco.de
+                       dashboard as a PUBLIC env var named SPOTIFY_CLIENT_ID — the
+                       app loads it at startup from /_lovely/env.js. In the Spotify
+                       dashboard, register your Redirect URIs:
+                         production:  https://listen-to-this.lovelyco.de/
+                         local test:  http://127.0.0.1:5501/
+                                      http://127.0.0.1:5501/index.html
+                       (Spotify allows https:// or the http loopback 127.0.0.1 —
+                       "localhost" is not accepted.)
+
+   The ANTHROPIC API KEY is NOT here. Save it in the lovelyco.de dashboard as a
+   SECRET env var named ANTHROPIC_API_KEY, and add `api.anthropic.com` under
+   "Allowed API hosts". Claude is called via lovelyco's edge proxy (below): the
+   browser sends the literal placeholder "{{ANTHROPIC_API_KEY}}" through
+   /_lovely/proxy/..., and the edge substitutes the real key. The key is never
+   sent to the browser, and the response stream is redacted for leaked secrets.
+   ========================================================================== */
+// Loaded at startup from lovelyco's /_lovely/env.js (see loadConfig). Set
+// SPOTIFY_CLIENT_ID as a PUBLIC env var in the lovelyco.de dashboard.
+let SPOTIFY_CLIENT_ID = "";
+
+// Claude via lovelyco's edge proxy. CLAUDE_KEY is a placeholder that the edge
+// replaces with the real ANTHROPIC_API_KEY secret as the request passes through
+// the proxy — it is NOT the real key. Requires api.anthropic.com in "Allowed
+// API hosts" (the proxy returns 403 otherwise).
+const CLAUDE_URL = "/_lovely/proxy/api.anthropic.com/v1/messages";
+const CLAUDE_KEY = "{{ANTHROPIC_API_KEY}}";
+const CLAUDE_MODEL = "claude-sonnet-4-6";
+
+const SPOTIFY_SCOPE = "user-top-read";
+const REDIRECT_URI = window.location.origin + window.location.pathname;
+
+// Pull public config (the Spotify Client ID) from lovelyco's env module. On
+// lovelyco this returns the real value; locally (no /_lovely/env.js) it's skipped
+// and SPOTIFY_CLIENT_ID stays empty, so the app shows a clear "not set" message.
+async function loadConfig() {
+  try {
+    const env = await import("/_lovely/env.js");
+    if (env.SPOTIFY_CLIENT_ID) SPOTIFY_CLIENT_ID = env.SPOTIFY_CLIENT_ID;
+  } catch {
+    /* /_lovely/env.js unavailable (e.g. a plain local static server) */
+  }
+}
+
+// localStorage keys
+const LS = {
+  token: "ltt_spotify_token",
+  refresh: "ltt_spotify_refresh",
+  expiry: "ltt_spotify_expiry",
+  verifier: "ltt_pkce_verifier",
+  state: "ltt_oauth_state",
+};
+
+/* ----------------------------- DOM helper ------------------------------- */
+const card = document.getElementById("card");
+function render(html) { card.innerHTML = html; }
+
+/* In-memory state for the session */
+let tasteProfile = null;       // cached system text built from Spotify data
+let tasteSummary = null;       // short {artists:[], tracks:[]} for display
+const previousRecs = [];       // names already suggested, to avoid repeats
+
+/* ============================================================================
+   PKCE helpers
+   ========================================================================== */
+function base64url(bytes) {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function randomString(byteLen) {
+  const arr = new Uint8Array(byteLen);
+  crypto.getRandomValues(arr);
+  return base64url(arr.buffer);
+}
+async function sha256(str) {
+  return crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+}
+
+/* ============================================================================
+   Spotify auth
+   ========================================================================== */
+async function beginLogin() {
+  const verifier = randomString(64);            // ~86 chars, within 43–128
+  const challenge = base64url(await sha256(verifier));
+  const state = randomString(16);
+
+  localStorage.setItem(LS.verifier, verifier);
+  localStorage.setItem(LS.state, state);
+
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: SPOTIFY_CLIENT_ID,
+    scope: SPOTIFY_SCOPE,
+    redirect_uri: REDIRECT_URI,
+    code_challenge_method: "S256",
+    code_challenge: challenge,
+    state,
+  });
+  window.location = "https://accounts.spotify.com/authorize?" + params.toString();
+}
+
+async function exchangeCodeForToken(code) {
+  const verifier = localStorage.getItem(LS.verifier);
+  if (!verifier) throw new Error("Missing PKCE verifier — please log in again.");
+
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: REDIRECT_URI,
+    client_id: SPOTIFY_CLIENT_ID,
+    code_verifier: verifier,
+  });
+
+  const res = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!res.ok) throw new Error("Spotify token exchange failed: " + (await res.text()));
+
+  const data = await res.json();
+  storeToken(data);
+  localStorage.removeItem(LS.verifier);
+}
+
+async function refreshToken() {
+  const refresh = localStorage.getItem(LS.refresh);
+  if (!refresh) return false;
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: refresh,
+    client_id: SPOTIFY_CLIENT_ID,
+  });
+  const res = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!res.ok) return false;
+
+  storeToken(await res.json());
+  return true;
+}
+
+function storeToken(data) {
+  localStorage.setItem(LS.token, data.access_token);
+  if (data.refresh_token) localStorage.setItem(LS.refresh, data.refresh_token);
+  // refresh 60s before actual expiry
+  localStorage.setItem(LS.expiry, String(Date.now() + (data.expires_in - 60) * 1000));
+}
+
+function getValidTokenOrNull() {
+  const token = localStorage.getItem(LS.token);
+  const expiry = Number(localStorage.getItem(LS.expiry) || 0);
+  if (token && Date.now() < expiry) return token;
+  return null;
+}
+
+function logout() {
+  Object.values(LS).forEach((k) => localStorage.removeItem(k));
+  window.location = REDIRECT_URI; // reload clean
+}
+
+/* ============================================================================
+   Spotify data fetch
+   ========================================================================== */
+async function spotifyGet(path) {
+  let token = getValidTokenOrNull();
+  if (!token) {
+    const refreshed = await refreshToken();
+    if (!refreshed) throw new Error("AUTH_EXPIRED");
+    token = localStorage.getItem(LS.token);
+  }
+
+  let res = await fetch("https://api.spotify.com/v1" + path, {
+    headers: { Authorization: "Bearer " + token },
+  });
+
+  // Token rejected mid-session → try one refresh, then retry
+  if (res.status === 401) {
+    const refreshed = await refreshToken();
+    if (!refreshed) throw new Error("AUTH_EXPIRED");
+    res = await fetch("https://api.spotify.com/v1" + path, {
+      headers: { Authorization: "Bearer " + localStorage.getItem(LS.token) },
+    });
+  }
+  if (!res.ok) throw new Error("Spotify API error (" + res.status + "): " + (await res.text()));
+  return res.json();
+}
+
+async function fetchTasteData() {
+  const [artistsRes, tracksRes] = await Promise.all([
+    spotifyGet("/me/top/artists?time_range=medium_term&limit=20"),
+    spotifyGet("/me/top/tracks?time_range=medium_term&limit=20"),
+  ]);
+
+  const artists = (artistsRes.items || []).map((a) => ({
+    name: a.name,
+    genres: a.genres || [],
+  }));
+  const tracks = (tracksRes.items || []).map((t) => ({
+    name: t.name,
+    artist: (t.artists || []).map((x) => x.name).join(", "),
+  }));
+
+  tasteSummary = { artists, tracks };
+
+  // Build the stable text block we send to Claude (and prompt-cache).
+  const artistLines = artists.map((a, i) =>
+    `${i + 1}. ${a.name}${a.genres.length ? " — " + a.genres.join(", ") : ""}`
+  );
+  const trackLines = tracks.map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`);
+
+  tasteProfile =
+    "LISTENER'S TASTE PROFILE (Spotify, medium-term)\n\n" +
+    "Top artists:\n" + artistLines.join("\n") +
+    "\n\nTop tracks:\n" + trackLines.join("\n");
+}
+
+/* ============================================================================
+   Claude recommendation.
+   The request is sent through lovelyco's edge proxy (CLAUDE_URL), which swaps
+   the "{{ANTHROPIC_API_KEY}}" placeholder for the real key server-side. The
+   prompt is built here in the browser, which is fine — it contains no secret.
+   ========================================================================== */
+const SYSTEM_INSTRUCTIONS =
+  "You are a discerning music curator with deep, wide-ranging knowledge across " +
+  "genres, eras, scenes, and the long tail of music. You will be given a listener's " +
+  "taste profile. Analyze it for patterns: genre, mood, era, instrumentation, " +
+  "production style, and how obscure vs. mainstream their taste runs. Then recommend " +
+  "exactly ONE specific album or artist they most likely have NOT already heard. " +
+  "Avoid obvious or mainstream suggestions, and avoid anything that merely duplicates " +
+  "what they already listen to — make a thoughtful lateral move that genuinely fits " +
+  "the through-line of their taste.\n\n" +
+  "Respond with ONLY a JSON object — no markdown, no code fence, no preamble — in " +
+  'exactly this shape:\n' +
+  '{"name": "<album or artist name>", "type": "album" | "artist", ' +
+  '"artist": "<the artist name, for searching>", ' +
+  '"reasoning": "<2-3 sentences connecting it to their taste>"}';
+
+async function getRecommendation() {
+  const avoidClause = previousRecs.length
+    ? "\n\nDo NOT recommend any of these (already suggested) — pick something different:\n- " +
+      previousRecs.join("\n- ")
+    : "";
+
+  const requestBody = {
+    model: CLAUDE_MODEL,
+    max_tokens: 1024,
+    temperature: 1, // variety across repeated "give me another" calls
+    system: [
+      { type: "text", text: SYSTEM_INSTRUCTIONS },
+      // The taste profile is identical across a session's repeat calls, so cache
+      // it — every "give me another" then reads it at ~0.1x input cost.
+      { type: "text", text: tasteProfile, cache_control: { type: "ephemeral" } },
+    ],
+    messages: [
+      { role: "user", content: "Give me one recommendation for this listener." + avoidClause },
+    ],
+  };
+
+  const res = await fetch(CLAUDE_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": CLAUDE_KEY, // placeholder; substituted at the edge
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify(requestBody),
+  });
+
+  if (!res.ok) throw new Error("Claude API error (" + res.status + "): " + (await res.text()));
+
+  const data = await res.json();
+  const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+  const rec = parseRecJSON(text);
+  if (rec && rec.name) previousRecs.push(rec.name);
+  return { rec, raw: text };
+}
+
+function parseRecJSON(text) {
+  // Tolerant: grab the outermost {...} in case the model adds stray text.
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1) return null;
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+/* ============================================================================
+   Views
+   ========================================================================== */
+function viewLogin() {
+  render(`
+    <p class="kicker">listen to this</p>
+    <h1>One album. Picked for your ears.</h1>
+    <p>Connect Spotify and Claude will study your top artists and tracks, then hand you a
+       single off-the-radar recommendation — with a short note on why it fits.</p>
+    <div class="row">
+      <button class="btn-primary" id="login">Connect Spotify</button>
+    </div>
+  `);
+  document.getElementById("login").onclick = () => {
+    if (!SPOTIFY_CLIENT_ID) {
+      viewError("SPOTIFY_CLIENT_ID is not set. Add it as a Public env var in the lovelyco.de dashboard.");
+      return;
+    }
+    beginLogin();
+  };
+}
+
+function viewLoading(message) {
+  render(`
+    <p class="kicker">listen to this</p>
+    <div class="loading-row"><div class="spinner"></div><span>${message}</span></div>
+  `);
+}
+
+function viewError(message) {
+  render(`
+    <p class="kicker">listen to this</p>
+    <h1>Something went sideways</h1>
+    <div class="error">${escapeHtml(message)}</div>
+    <div class="row">
+      <button class="btn-ghost" id="retry">Try again</button>
+      <button class="link-btn" id="reset">Reset &amp; log out</button>
+    </div>
+  `);
+  document.getElementById("retry").onclick = boot;
+  document.getElementById("reset").onclick = logout;
+}
+
+function viewRecommendation(rec, raw) {
+  if (!rec) {
+    // Parsing failed — show Claude's raw text so nothing is hidden from the user.
+    render(`
+      <p class="kicker">listen to this</p>
+      <h1>Here's what Claude said</h1>
+      <div class="rec-reason">${escapeHtml(raw || "(empty response)")}</div>
+      <div class="row">
+        <button class="btn-primary" id="again">Give me another</button>
+      </div>
+    `);
+    wireAgain();
+    return;
+  }
+
+  const query = encodeURIComponent(
+    rec.type === "album" && rec.artist ? `${rec.artist} ${rec.name}` : rec.name
+  );
+  const spotifySearch = "https://open.spotify.com/search/" + query;
+
+  render(`
+    <p class="kicker">a recommendation for you</p>
+    <span class="rec-type">${escapeHtml(rec.type || "pick")}</span>
+    <h2 class="rec-name">${escapeHtml(rec.name)}</h2>
+    ${rec.artist && rec.artist !== rec.name
+      ? `<p class="rec-artist">${escapeHtml(rec.artist)}</p>` : ""}
+    <div class="rec-reason">${escapeHtml(rec.reasoning || "")}</div>
+    <a class="spotify-link" href="${spotifySearch}" target="_blank" rel="noopener">
+      ▶ Find it on Spotify
+    </a>
+    <div class="row" style="margin-top:24px;">
+      <button class="btn-primary" id="again">Give me another</button>
+    </div>
+    <div class="meta">
+      <span>Based on ${tasteSummary.artists.length} top artists &amp; ${tasteSummary.tracks.length} tracks</span>
+      <button class="link-btn" id="reset">Log out</button>
+    </div>
+  `);
+  wireAgain();
+  document.getElementById("reset").onclick = logout;
+}
+
+function wireAgain() {
+  const btn = document.getElementById("again");
+  if (btn) btn.onclick = requestAndShow;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ============================================================================
+   Flow orchestration
+   ========================================================================== */
+async function requestAndShow() {
+  viewLoading("Consulting Claude…");
+  try {
+    const { rec, raw } = await getRecommendation();
+    viewRecommendation(rec, raw);
+  } catch (e) {
+    viewError(e.message || String(e));
+  }
+}
+
+async function boot() {
+  await loadConfig();
+  if (!SPOTIFY_CLIENT_ID) {
+    viewError("SPOTIFY_CLIENT_ID is not set. Add it as a Public env var named " +
+              "SPOTIFY_CLIENT_ID in the lovelyco.de dashboard.");
+    return;
+  }
+
+  const url = new URL(window.location.href);
+  const code = url.searchParams.get("code");
+  const returnedState = url.searchParams.get("state");
+  const oauthError = url.searchParams.get("error");
+
+  if (oauthError) {
+    viewError("Spotify authorization was denied or failed: " + oauthError);
+    return;
+  }
+
+  // Returning from Spotify with an auth code
+  if (code) {
+    const savedState = localStorage.getItem(LS.state);
+    if (!savedState || savedState !== returnedState) {
+      viewError("OAuth state mismatch — possible tampering. Please log in again.");
+      return;
+    }
+    viewLoading("Finishing sign-in…");
+    try {
+      await exchangeCodeForToken(code);
+      localStorage.removeItem(LS.state);
+      // Clean the ?code=... out of the URL
+      window.history.replaceState({}, document.title, REDIRECT_URI);
+    } catch (e) {
+      viewError(e.message || String(e));
+      return;
+    }
+  }
+
+  // Need a valid (or refreshable) token to proceed
+  if (!getValidTokenOrNull()) {
+    const refreshed = await refreshToken();
+    if (!refreshed) { viewLogin(); return; }
+  }
+
+  // Authenticated → fetch data (once) and get the first recommendation
+  try {
+    if (!tasteProfile) {
+      viewLoading("Reading your Spotify taste…");
+      await fetchTasteData();
+    }
+    await requestAndShow();
+  } catch (e) {
+    if (e.message === "AUTH_EXPIRED") { viewLogin(); return; }
+    viewError(e.message || String(e));
+  }
+}
+
+boot();
+</script>
+</body>
+</html>
