@@ -430,6 +430,9 @@ async function getRecommendation() {
       "content-type": "application/json",
       "x-api-key": CLAUDE_KEY, // placeholder; substituted at the edge
       "anthropic-version": "2023-06-01",
+      // The proxy forwards the browser's Origin header, so Anthropic treats this
+      // as a CORS request and requires this flag. (No secret — just enables CORS.)
+      "anthropic-dangerous-direct-browser-access": "true",
     },
     body: JSON.stringify(requestBody),
   });
