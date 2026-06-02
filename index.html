@@ -76,6 +76,15 @@
   .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
 
   /* recommendation */
+  .rec-cover {
+    display: block;
+    width: 168px;
+    height: 168px;
+    object-fit: cover;
+    border-radius: 14px;
+    box-shadow: 0 12px 30px rgba(0,0,0,.45);
+    margin: 0 0 18px;
+  }
   .rec-type {
     display: inline-block;
     font-size: 11px;
@@ -191,7 +200,7 @@ const CLAUDE_URL = "/_lovely/proxy/api.anthropic.com/v1/messages";
 const CLAUDE_KEY = "{{ANTHROPIC_API_KEY}}";
 const CLAUDE_MODEL = "claude-sonnet-4-6";
 
-const SPOTIFY_SCOPE = "user-top-read";
+const SPOTIFY_SCOPE = "user-library-read";
 const REDIRECT_URI = window.location.origin + window.location.pathname;
 
 // Pull public config (the Spotify Client ID) from lovelyco's env module. On
@@ -326,6 +335,10 @@ function logout() {
   window.location = REDIRECT_URI; // reload clean
 }
 
+function clearTokens() {
+  [LS.token, LS.refresh, LS.expiry].forEach((k) => localStorage.removeItem(k));
+}
+
 /* ============================================================================
    Spotify data fetch
    ========================================================================== */
@@ -349,37 +362,117 @@ async function spotifyGet(path) {
       headers: { Authorization: "Bearer " + localStorage.getItem(LS.token) },
     });
   }
+  // 403 = the stored token predates the user-library-read scope. A refresh keeps
+  // the same scopes, so force a fresh login to re-prompt for library access.
+  if (res.status === 403) throw new Error("INSUFFICIENT_SCOPE");
   if (!res.ok) throw new Error("Spotify API error (" + res.status + "): " + (await res.text()));
   return res.json();
 }
 
 async function fetchTasteData() {
-  const [artistsRes, tracksRes] = await Promise.all([
-    spotifyGet("/me/top/artists?time_range=medium_term&limit=20"),
-    spotifyGet("/me/top/tracks?time_range=medium_term&limit=20"),
-  ]);
+  const PAGE = 50;
+  const TARGET = 600; // tracks to sample for the profile
 
-  const artists = (artistsRes.items || []).map((a) => ({
-    name: a.name,
-    genres: a.genres || [],
-  }));
-  const tracks = (tracksRes.items || []).map((t) => ({
-    name: t.name,
-    artist: (t.artists || []).map((x) => x.name).join(", "),
-  }));
+  // First page tells us how big the library is.
+  const first = await spotifyGet(`/me/tracks?limit=${PAGE}&offset=0`);
+  const total = first.total || (first.items || []).length;
 
-  tasteSummary = { artists, tracks };
+  // Sample pages spread evenly across the WHOLE library. /me/tracks is
+  // newest-first, so reading only the front would reintroduce recency bias —
+  // instead we step across the full offset range.
+  const pagesNeeded = Math.max(1, Math.min(Math.ceil(TARGET / PAGE), Math.ceil(total / PAGE)));
+  const lastOffset = Math.max(0, total - PAGE);
+  const offsets = new Set([0]);
+  for (let i = 1; i < pagesNeeded; i++) {
+    const raw = Math.round((lastOffset * i) / (pagesNeeded - 1));
+    offsets.add(raw - (raw % PAGE)); // align to a page boundary
+  }
 
-  // Build the stable text block we send to Claude (and prompt-cache).
-  const artistLines = artists.map((a, i) =>
-    `${i + 1}. ${a.name}${a.genres.length ? " — " + a.genres.join(", ") : ""}`
+  const pages = [first];
+  const others = [...offsets].filter((o) => o !== 0);
+  if (others.length) {
+    pages.push(...(await Promise.all(others.map((o) => spotifyGet(`/me/tracks?limit=${PAGE}&offset=${o}`)))));
+  }
+
+  // Flatten to tracks, de-duped by id.
+  const seen = new Set();
+  const items = [];
+  for (const p of pages) {
+    for (const it of p.items || []) {
+      const t = it.track;
+      if (t && t.id && !seen.has(t.id)) { seen.add(t.id); items.push(t); }
+    }
+  }
+
+  // Aggregate artist frequency across the sample + collect track titles.
+  const artistCount = new Map(); // id -> { name, count }
+  const tracks = [];
+  for (const t of items) {
+    (t.artists || []).forEach((a) => {
+      if (!a.id) return;
+      const e = artistCount.get(a.id) || { name: a.name, count: 0 };
+      e.count++;
+      artistCount.set(a.id, e);
+    });
+    tracks.push({ name: t.name, artist: (t.artists || []).map((x) => x.name).join(", ") });
+  }
+
+  const topArtists = [...artistCount.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 50);
+
+  // Genres live on the artist object, not the track — fetch them in one batch.
+  const ids = topArtists.map(([id]) => id).slice(0, 50);
+  const genreById = {};
+  if (ids.length) {
+    try {
+      const ar = await spotifyGet("/artists?ids=" + ids.join(","));
+      (ar.artists || []).forEach((a) => { if (a) genreById[a.id] = a.genres || []; });
+    } catch { /* genres are a nice-to-have */ }
+  }
+
+  const genreCount = new Map();
+  topArtists.forEach(([id, e]) =>
+    (genreById[id] || []).forEach((g) => genreCount.set(g, (genreCount.get(g) || 0) + e.count))
   );
-  const trackLines = tracks.map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`);
+  const topGenres = [...genreCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([g]) => g);
+
+  // An evenly-spread sample of track titles.
+  const sampleTracks = [];
+  const step = Math.max(1, Math.floor(tracks.length / 30));
+  for (let i = 0; i < tracks.length && sampleTracks.length < 30; i += step) sampleTracks.push(tracks[i]);
+
+  tasteSummary = { libraryTotal: total, sampled: items.length };
+
+  const artistLines = topArtists.slice(0, 40).map(([id, e], i) =>
+    `${i + 1}. ${e.name} — ${e.count} saved track${e.count === 1 ? "" : "s"}` +
+    ((genreById[id] && genreById[id].length) ? " — " + genreById[id].join(", ") : "")
+  );
+  const trackLines = sampleTracks.map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`);
 
   tasteProfile =
-    "LISTENER'S TASTE PROFILE (Spotify, medium-term)\n\n" +
-    "Top artists:\n" + artistLines.join("\n") +
-    "\n\nTop tracks:\n" + trackLines.join("\n");
+    `LISTENER'S SAVED LIBRARY (Spotify) — ${total} saved tracks total; ` +
+    `${items.length} sampled evenly across the whole library (not just recent saves).\n\n` +
+    "Most-saved artists (with genres):\n" + artistLines.join("\n") +
+    "\n\nDominant genres: " + (topGenres.length ? topGenres.join(", ") : "(unavailable)") +
+    "\n\nA spread of tracks from across the library:\n" + trackLines.join("\n");
+}
+
+// Look up cover art + a direct Spotify link for the recommendation (search needs
+// no special scope). Falls back to no image / a search link if nothing matches.
+async function fetchCover(rec) {
+  try {
+    const type = rec.type === "album" ? "album" : "artist";
+    const q = type === "album" && rec.artist && rec.artist !== rec.name
+      ? `${rec.artist} ${rec.name}` : rec.name;
+    const data = await spotifyGet(`/search?q=${encodeURIComponent(q)}&type=${type}&limit=1`);
+    const item = type === "album" ? data.albums?.items?.[0] : data.artists?.items?.[0];
+    if (item) {
+      return {
+        imageUrl: (item.images && item.images[0] && item.images[0].url) || "",
+        spotifyUrl: (item.external_urls && item.external_urls.spotify) || "",
+      };
+    }
+  } catch { /* fall back to a plain search link below */ }
+  return { imageUrl: "", spotifyUrl: "" };
 }
 
 /* ============================================================================
@@ -461,12 +554,13 @@ function parseRecJSON(text) {
 /* ============================================================================
    Views
    ========================================================================== */
-function viewLogin() {
+function viewLogin(note) {
   render(`
     <p class="kicker">listen to this</p>
     <h1>One album. Picked for your ears.</h1>
-    <p>Connect Spotify and Claude will study your top artists and tracks, then hand you a
+    <p>Connect Spotify and Claude will study your saved library, then hand you a
        single off-the-radar recommendation — with a short note on why it fits.</p>
+    ${note ? `<div class="error">${escapeHtml(note)}</div>` : ""}
     <div class="row">
       <button class="btn-primary" id="login">Connect Spotify</button>
     </div>
@@ -501,7 +595,9 @@ function viewError(message) {
   document.getElementById("reset").onclick = logout;
 }
 
-function viewRecommendation(rec, raw) {
+function viewRecommendation(rec, raw, cover) {
+  cover = cover || { imageUrl: "", spotifyUrl: "" };
+
   if (!rec) {
     // Parsing failed — show Claude's raw text so nothing is hidden from the user.
     render(`
@@ -516,26 +612,28 @@ function viewRecommendation(rec, raw) {
     return;
   }
 
-  const query = encodeURIComponent(
+  const fallbackSearch = "https://open.spotify.com/search/" + encodeURIComponent(
     rec.type === "album" && rec.artist ? `${rec.artist} ${rec.name}` : rec.name
   );
-  const spotifySearch = "https://open.spotify.com/search/" + query;
+  const link = cover.spotifyUrl || fallbackSearch;
+  const libCount = (tasteSummary && tasteSummary.libraryTotal || 0).toLocaleString();
 
   render(`
     <p class="kicker">a recommendation for you</p>
+    ${cover.imageUrl
+      ? `<img class="rec-cover" src="${cover.imageUrl}" alt="${escapeHtml(rec.name)} cover art" />`
+      : ""}
     <span class="rec-type">${escapeHtml(rec.type || "pick")}</span>
     <h2 class="rec-name">${escapeHtml(rec.name)}</h2>
     ${rec.artist && rec.artist !== rec.name
       ? `<p class="rec-artist">${escapeHtml(rec.artist)}</p>` : ""}
     <div class="rec-reason">${escapeHtml(rec.reasoning || "")}</div>
-    <a class="spotify-link" href="${spotifySearch}" target="_blank" rel="noopener">
-      ▶ Find it on Spotify
-    </a>
+    <a class="spotify-link" href="${link}" target="_blank" rel="noopener">▶ Open in Spotify</a>
     <div class="row" style="margin-top:24px;">
       <button class="btn-primary" id="again">Give me another</button>
     </div>
     <div class="meta">
-      <span>Based on ${tasteSummary.artists.length} top artists &amp; ${tasteSummary.tracks.length} tracks</span>
+      <span>Based on your library of ${libCount} saved tracks</span>
       <button class="link-btn" id="reset">Log out</button>
     </div>
   `);
@@ -560,7 +658,8 @@ async function requestAndShow() {
   viewLoading("Consulting Claude…");
   try {
     const { rec, raw } = await getRecommendation();
-    viewRecommendation(rec, raw);
+    const cover = rec && rec.name ? await fetchCover(rec) : { imageUrl: "", spotifyUrl: "" };
+    viewRecommendation(rec, raw, cover);
   } catch (e) {
     viewError(e.message || String(e));
   }
@@ -612,12 +711,17 @@ async function boot() {
   // Authenticated → fetch data (once) and get the first recommendation
   try {
     if (!tasteProfile) {
-      viewLoading("Reading your Spotify taste…");
+      viewLoading("Reading your Spotify library…");
       await fetchTasteData();
     }
     await requestAndShow();
   } catch (e) {
     if (e.message === "AUTH_EXPIRED") { viewLogin(); return; }
+    if (e.message === "INSUFFICIENT_SCOPE") {
+      clearTokens();
+      viewLogin("This now reads your Liked Songs — please reconnect Spotify to grant access.");
+      return;
+    }
     viewError(e.message || String(e));
   }
 }
