@@ -261,6 +261,7 @@ const LS = {
   state: "ltt_oauth_state",
   library: "ltt_library_v1", // cached taste profile (JSON), so we don't re-read Spotify every load
   playlist: "ltt_playlist_id", // the one reusable scratch playlist we keep replacing
+  scope: "ltt_granted_scope", // scopes Spotify actually granted the current token (for diagnostics)
 };
 
 /* ----------------------------- DOM helper ------------------------------- */
@@ -306,6 +307,7 @@ async function beginLogin() {
     code_challenge_method: "S256",
     code_challenge: challenge,
     state,
+    show_dialog: "true", // always show consent so newly-added scopes are actually granted
   });
   window.location = "https://accounts.spotify.com/authorize?" + params.toString();
 }
@@ -357,6 +359,7 @@ async function refreshToken() {
 function storeToken(data) {
   localStorage.setItem(LS.token, data.access_token);
   if (data.refresh_token) localStorage.setItem(LS.refresh, data.refresh_token);
+  if (data.scope) localStorage.setItem(LS.scope, data.scope); // what Spotify actually granted
   // refresh 60s before actual expiry
   localStorage.setItem(LS.expiry, String(Date.now() + (data.expires_in - 60) * 1000));
 }
@@ -406,9 +409,20 @@ async function spotifyApi(path, { method = "GET", body } = {}) {
     if (!refreshed) throw new Error("AUTH_EXPIRED");
     res = await fetch("https://api.spotify.com/v1" + path, build(localStorage.getItem(LS.token)));
   }
-  // 403 = token lacks a required scope (e.g. an older session from before we added
-  // playlist access). A refresh keeps the same scopes, so force a fresh login.
-  if (res.status === 403) throw new Error("INSUFFICIENT_SCOPE");
+  // 403 = Spotify refused it. Usually a missing scope, but it can also be e.g.
+  // a dev-mode user restriction. Surface the real reason + the granted scopes so
+  // we don't loop blindly on "reconnect".
+  if (res.status === 403) {
+    const detail = (await res.text()).slice(0, 400);
+    const granted = localStorage.getItem(LS.scope) || "(unknown)";
+    throw new Error(
+      "Spotify refused this request (403 — usually a missing permission).\n\n" +
+      "Scopes your last login granted: " + granted + "\n" +
+      "Scopes needed: user-library-read playlist-modify-private\n\n" +
+      "Fix: tap “Reset & log out” below, then reconnect Spotify and approve the access.\n\n" +
+      "Spotify said: " + (detail || "(no details)")
+    );
+  }
   if (!res.ok) throw new Error("Spotify API error (" + res.status + "): " + (await res.text()));
 
   const text = await res.text(); // some write endpoints return an empty body
@@ -789,12 +803,12 @@ function escapeHtml(s) {
    Flow orchestration
    ========================================================================== */
 function handleFlowError(e) {
-  if (e.message === "AUTH_EXPIRED" || e.message === "INSUFFICIENT_SCOPE") {
+  if (e.message === "AUTH_EXPIRED") {
     clearTokens();
-    viewLogin("This needs permission to manage a playlist — please reconnect Spotify.");
+    viewLogin("Please reconnect Spotify.");
     return;
   }
-  viewError(e.message || String(e));
+  viewError(e.message || String(e)); // 403s show their full diagnostic here
 }
 
 async function regenerate() {
@@ -862,12 +876,7 @@ async function boot() {
     await buildPlaylist();
   } catch (e) {
     if (e.message === "AUTH_EXPIRED") { viewLogin(); return; }
-    if (e.message === "INSUFFICIENT_SCOPE") {
-      clearTokens();
-      viewLogin("Reconnect Spotify to grant the new access (library + playlist).");
-      return;
-    }
-    viewError(e.message || String(e));
+    viewError(e.message || String(e)); // 403s show their full diagnostic here
   }
 }
 
