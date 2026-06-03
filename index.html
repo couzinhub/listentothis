@@ -119,15 +119,18 @@
   .player iframe { border-radius: 12px; display: block; }
   .track-list { display: flex; flex-direction: column; gap: 2px; }
   .track-row {
-    display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+    display: flex; flex-direction: row; align-items: center; gap: 12px;
     width: 100%; text-align: left; font: inherit; font-weight: 400; color: var(--text);
-    background: none; border: 0; border-radius: 10px; padding: 9px 12px; cursor: pointer;
+    background: none; border: 0; border-radius: 10px; padding: 8px 12px; cursor: pointer;
   }
   .track-row:hover { background: var(--panel-2); }
   .track-row.is-playing { background: var(--panel-2); }
   .track-row.is-playing .track-row-name { color: var(--accent); }
-  .track-row-name { font-size: 15px; font-weight: 600; }
-  .track-row-artist { font-size: 13px; color: var(--muted); }
+  .track-thumb { width: 44px; height: 44px; border-radius: 6px; object-fit: cover; flex: none; }
+  .track-thumb--empty { background: var(--panel-2); }
+  .track-row-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .track-row-name { font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .track-row-artist { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
   .track-row--missing { cursor: default; opacity: .5; }
   .track-row--missing:hover { background: none; }
   @media (max-width: 460px) {
@@ -296,6 +299,17 @@ const iframeApiReady = new Promise((resolve) => {
   s.async = true;
   document.head.appendChild(s);
 })();
+
+// Keyboard: space = play/pause, ←/→ = previous/next track (only when a player exists,
+// and not while the cross-origin Spotify iframe itself has focus — click the page first).
+document.addEventListener("keydown", (e) => {
+  if (!_controller || e.metaKey || e.ctrlKey || e.altKey) return;
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "INPUT" || tag === "TEXTAREA") return;
+  if (e.code === "Space" || e.key === " ") { e.preventDefault(); _controller.togglePlay(); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); playIndex(_cur + 1); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); playIndex(_cur - 1); }
+});
 
 /* ============================================================================
    PKCE helpers
@@ -578,7 +592,7 @@ function loadLibraryCache() {
 async function enrichTrack(t) {
   const track = t.track || t.name || "";
   const artist = t.artist || "";
-  const result = { track, artist, found: false, id: "", name: "", artistName: "" };
+  const result = { track, artist, found: false, id: "", name: "", artistName: "", imageUrl: "" };
   if (!track) return result;
   try {
     const data = await spotifyGet(`/search?q=${encodeURIComponent(track + " " + artist)}&type=track&limit=1`);
@@ -588,6 +602,8 @@ async function enrichTrack(t) {
       result.id = item.id;
       result.name = item.name;
       result.artistName = (item.artists || []).map((a) => a.name).join(", ");
+      const imgs = (item.album && item.album.images) || [];
+      result.imageUrl = imgs.length ? imgs[imgs.length - 1].url : ""; // smallest (~64px) for the thumb
     }
   } catch { /* leave as not-found; we show Claude's text instead */ }
   return result;
@@ -797,14 +813,22 @@ function viewSet(items) {
 
   const rows = playable.map((r, i) =>
     `<button class="track-row" data-i="${i}">
-       <span class="track-row-name">${escapeHtml(r.name || r.track)}</span>
-       <span class="track-row-artist">${escapeHtml(r.artistName || r.artist)}</span>
+       ${r.imageUrl
+         ? `<img class="track-thumb" src="${r.imageUrl}" alt="" />`
+         : `<span class="track-thumb track-thumb--empty"></span>`}
+       <span class="track-row-text">
+         <span class="track-row-name">${escapeHtml(r.name || r.track)}</span>
+         <span class="track-row-artist">${escapeHtml(r.artistName || r.artist)}</span>
+       </span>
      </button>`
   ).join("");
   const missingRows = missing.map((r) =>
     `<div class="track-row track-row--missing">
-       <span class="track-row-name">${escapeHtml(r.track)}</span>
-       <span class="track-row-artist">${escapeHtml(r.artist)} · not on Spotify</span>
+       <span class="track-thumb track-thumb--empty"></span>
+       <span class="track-row-text">
+         <span class="track-row-name">${escapeHtml(r.track)}</span>
+         <span class="track-row-artist">${escapeHtml(r.artist)} · not on Spotify</span>
+       </span>
      </div>`
   ).join("");
 
