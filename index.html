@@ -17,14 +17,14 @@
     --danger: #ff6b6b;
   }
   * { box-sizing: border-box; }
-  html, body { height: 100%; }
+  html, body { min-height: 100%; }
   body {
     margin: 0;
     background: radial-gradient(1200px 600px at 50% -10%, #1a1d27 0%, var(--bg) 55%);
     color: var(--text);
     font: 16px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     display: flex;
-    align-items: center;
+    align-items: flex-start;   /* top-aligned so tall content scrolls naturally */
     justify-content: center;
     padding: 32px;
   }
@@ -730,10 +730,7 @@ function viewSet(items) {
 
   render(`
     <div class="card">
-      <p class="kicker">your picks</p>
-      <h1 class="pl-title">A set, picked for you</h1>
       <div class="track-list">${rows}</div>
-      <p class="note">Plays right here — full tracks if you're signed into Spotify Premium in this browser, otherwise 30-second previews. Nothing is saved to your account.</p>
     </div>
     <div class="below">
       <button class="btn-ghost" id="again">Give me another set</button>
