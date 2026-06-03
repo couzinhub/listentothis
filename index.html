@@ -115,10 +115,21 @@
   }
   .below .logout { align-self: flex-end; }
   .pl-title { font-size: 22px; margin: 0 0 16px; }
-  .track-list { display: flex; flex-direction: column; gap: 10px; margin: 8px 0 4px; }
-  .track-embed { border: 0; border-radius: 12px; display: block; }
-  .track-missing { color: var(--muted); font-size: 13px; padding: 6px 2px; }
-  .track-missing span { opacity: .65; }
+  .player { margin: 0 0 14px; }
+  .player iframe { border-radius: 12px; display: block; }
+  .track-list { display: flex; flex-direction: column; gap: 2px; }
+  .track-row {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+    width: 100%; text-align: left; font: inherit; font-weight: 400; color: var(--text);
+    background: none; border: 0; border-radius: 10px; padding: 9px 12px; cursor: pointer;
+  }
+  .track-row:hover { background: var(--panel-2); }
+  .track-row.is-playing { background: var(--panel-2); }
+  .track-row.is-playing .track-row-name { color: var(--accent); }
+  .track-row-name { font-size: 15px; font-weight: 600; }
+  .track-row-artist { font-size: 13px; color: var(--muted); }
+  .track-row--missing { cursor: default; opacity: .5; }
+  .track-row--missing:hover { background: none; }
   @media (max-width: 460px) {
     .rec-card { flex-direction: column; align-items: flex-start; }
     .rec-cover { width: 100%; height: auto; aspect-ratio: 1 / 1; }
@@ -271,6 +282,20 @@ function render(html) { stage.innerHTML = html; }
 /* In-memory state for the session */
 let library = null;            // cached pool of saved tracks + genres (see fetchLibrary)
 const previousRecs = [];       // track names already suggested, to avoid repeats across sets
+
+/* Spotify IFrame API — one controllable player we loadUri() into, with an
+   end-of-track event so we can auto-advance to the next song. */
+let _iframeApi = null, _controller = null;
+let _set = [], _cur = 0, _endedGuard = false;
+const iframeApiReady = new Promise((resolve) => {
+  window.onSpotifyIframeApiReady = (api) => { _iframeApi = api; resolve(api); };
+});
+(function loadIframeApi() {
+  const s = document.createElement("script");
+  s.src = "https://open.spotify.com/embed/iframe-api/v1";
+  s.async = true;
+  document.head.appendChild(s);
+})();
 
 /* ============================================================================
    PKCE helpers
@@ -719,18 +744,74 @@ function viewError(message) {
   document.getElementById("reset").onclick = logout;
 }
 
+// Create one player on #player and load the first track. Re-created per set.
+async function setupPlayer(playable) {
+  _set = playable;
+  _cur = 0;
+  _endedGuard = false;
+
+  const api = await iframeApiReady;
+  const el = document.getElementById("player");
+  if (!el) return;
+
+  if (_controller) { try { _controller.destroy(); } catch { /* old iframe already gone */ } _controller = null; }
+
+  api.createController(el, { uri: _set[0].uri, width: "100%", height: 152 }, (ctrl) => {
+    _controller = ctrl;
+    highlightRow(0);
+    ctrl.addListener("playback_update", (e) => {
+      const d = e && e.data;
+      if (!d || !d.duration) return;
+      // End of track → advance. Guard so it fires once; reset when clearly mid-track.
+      if (!_endedGuard && d.position >= d.duration - 800) { _endedGuard = true; playNext(); }
+      else if (d.position < d.duration - 1500) { _endedGuard = false; }
+    });
+  });
+}
+
+function playIndex(i) {
+  if (!_controller || !_set[i]) return;
+  _cur = i;
+  _endedGuard = false;
+  _controller.loadUri(_set[i].uri);
+  _controller.play();
+  highlightRow(i);
+}
+
+function playNext() {
+  if (_cur + 1 < _set.length) playIndex(_cur + 1);
+}
+
+function highlightRow(i) {
+  document.querySelectorAll(".track-row[data-i]").forEach((el) => {
+    el.classList.toggle("is-playing", Number(el.dataset.i) === i);
+  });
+}
+
 function viewSet(items) {
-  const rows = items.map((r) =>
-    r.found && r.id
-      ? `<iframe class="track-embed" src="https://open.spotify.com/embed/track/${r.id}"
-           width="100%" height="80" frameborder="0" loading="lazy"
-           allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`
-      : `<div class="track-missing">${escapeHtml(r.track)} — ${escapeHtml(r.artist)} <span>(not found on Spotify)</span></div>`
+  const playable = items
+    .filter((r) => r.found && r.id)
+    .map((r) => ({ ...r, uri: "spotify:track:" + r.id }));
+  if (!playable.length) { viewError("Couldn't match any of those on Spotify — try again."); return; }
+  const missing = items.filter((r) => !(r.found && r.id));
+
+  const rows = playable.map((r, i) =>
+    `<button class="track-row" data-i="${i}">
+       <span class="track-row-name">${escapeHtml(r.name || r.track)}</span>
+       <span class="track-row-artist">${escapeHtml(r.artistName || r.artist)}</span>
+     </button>`
+  ).join("");
+  const missingRows = missing.map((r) =>
+    `<div class="track-row track-row--missing">
+       <span class="track-row-name">${escapeHtml(r.track)}</span>
+       <span class="track-row-artist">${escapeHtml(r.artist)} · not on Spotify</span>
+     </div>`
   ).join("");
 
   render(`
     <div class="card">
-      <div class="track-list">${rows}</div>
+      <div id="player" class="player"></div>
+      <div class="track-list">${rows}${missingRows}</div>
     </div>
     <div class="below">
       <button class="btn-ghost" id="again">Give me another set</button>
@@ -739,6 +820,11 @@ function viewSet(items) {
   `);
   document.getElementById("again").onclick = regenerate;
   document.getElementById("reset").onclick = logout;
+  document.querySelectorAll(".track-row[data-i]").forEach((el) => {
+    el.onclick = () => playIndex(Number(el.dataset.i));
+  });
+
+  setupPlayer(playable);
 }
 
 function escapeHtml(s) {
